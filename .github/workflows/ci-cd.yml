@@ -32,13 +32,13 @@ jobs:
     steps:
       - name: Pull latest & restart
         run: |
-          ssh -o StrictHostKeyChecking=no ansible@192.168.50.113 \
+          ssh -o StrictHostKeyChecking=no pedro@192.168.50.113 \
             "cd /opt/knowledge-janitor && git pull && bun install --frozen-lockfile && sudo systemctl restart knowledge-janitor"
 
       - name: Health check
         run: |
           sleep 3
-          ssh -o StrictHostKeyChecking=no ansible@192.168.50.113 \
+          ssh -o StrictHostKeyChecking=no pedro@192.168.50.113 \
             "curl -sf http://localhost:3007/health"
 
       - name: Summary
