@@ -1,7 +1,7 @@
 # Knowledge Janitor Agent — Plan
 
 **Created**: 2026-04-08
-**Status**: Planned
+**Status**: Implemented (2026-04-09)
 **Port**: 3007
 **Schedule**: Weekly via MC Backend CronRunner
 
