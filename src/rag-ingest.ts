@@ -3,6 +3,7 @@
  * Only ingests files that pass staleness checks. Tracks hashes to avoid re-ingesting.
  */
 
+import { readFileSync, writeFileSync } from 'fs';
 import type { FileEntry } from './scanner.ts';
 
 export interface IngestResult {
@@ -12,13 +13,30 @@ export interface IngestResult {
   reason?: string;
 }
 
-// In-memory hash cache (resets on restart — acceptable for weekly runs)
-const ingestedHashes = new Map<string, string>(); // relativePath → contentHash
+const HASH_CACHE_PATH = process.env.INGEST_HASH_CACHE ?? '/opt/knowledge-janitor/ingest-hashes.json';
+
+function loadHashCache(): Map<string, string> {
+  try {
+    const raw = readFileSync(HASH_CACHE_PATH, 'utf-8');
+    return new Map(Object.entries(JSON.parse(raw)));
+  } catch {
+    return new Map();
+  }
+}
+
+function saveHashCache(cache: Map<string, string>): void {
+  try {
+    writeFileSync(HASH_CACHE_PATH, JSON.stringify(Object.fromEntries(cache), null, 2));
+  } catch (err) {
+    console.warn(`[rag-ingest] Failed to save hash cache: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
 
 export async function ingestToRag(
   entries: FileEntry[],
   blogApiUrl: string,
 ): Promise<IngestResult[]> {
+  const ingestedHashes = loadHashCache();
   const results: IngestResult[] = [];
 
   for (const entry of entries) {
@@ -64,6 +82,7 @@ export async function ingestToRag(
     }
   }
 
+  saveHashCache(ingestedHashes);
   return results;
 }
 

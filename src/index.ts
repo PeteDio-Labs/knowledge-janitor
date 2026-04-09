@@ -162,6 +162,8 @@ Be specific about file names. Keep the report under 400 words.
 const app = express();
 app.use(express.json());
 
+let activeTaskId: string | null = null;
+
 app.post('/run', async (req, res) => {
   const parsed = TaskPayloadSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -169,11 +171,21 @@ app.post('/run', async (req, res) => {
     return;
   }
 
+  if (activeTaskId) {
+    res.status(409).json({ error: 'Already running', activeTaskId });
+    return;
+  }
+
+  activeTaskId = parsed.data.taskId;
   res.json({ accepted: true, taskId: parsed.data.taskId });
 
-  runJanitor(parsed.data).catch(err => {
-    log.error({ err: err instanceof Error ? err.message : err }, 'Unhandled janitor error');
-  });
+  runJanitor(parsed.data)
+    .catch(err => {
+      log.error({ err: err instanceof Error ? err.message : err }, 'Unhandled janitor error');
+    })
+    .finally(() => {
+      activeTaskId = null;
+    });
 });
 
 app.get('/health', (_req, res) => {
