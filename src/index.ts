@@ -15,7 +15,7 @@ import { AgentReporter, runToolLoop } from '@petedio/shared/agents';
 import { TaskPayloadSchema } from '@petedio/shared/agents';
 import { KnowledgeJanitorInputSchema } from './schema.ts';
 import { buildTools, type JanitorState } from './tools.ts';
-import { formatActionsForApproval } from './cleaner.ts';
+import { formatActionsForApproval, executeCleanupActions } from './cleaner.ts';
 
 const log = pino({ level: process.env.LOG_LEVEL ?? 'info' });
 const PORT = parseInt(process.env.PORT ?? '3007', 10);
@@ -118,13 +118,26 @@ Be specific about file names. Keep the report under 400 words.
         preview,
       });
 
-      artifacts.push({
-        type: 'log' as const,
-        label: 'Cleanup approval',
-        content: approval.outcome === 'approved'
-          ? 'Approved — actions queued for execution in next session.'
-          : `Rejected${approval.reason ? ': ' + approval.reason : ''}`,
-      });
+      if (approval.outcome === 'approved') {
+        const execResults = await executeCleanupActions(state.actions, KNOWLEDGE_ROOT);
+        const done = execResults.filter(r => r.outcome === 'done').length;
+        const skipped = execResults.filter(r => r.outcome === 'skipped').length;
+        const failed = execResults.filter(r => r.outcome === 'error').length;
+        const execLines = execResults
+          .map(r => `- ${r.file} [${r.actionType}]: ${r.outcome} — ${r.detail}`)
+          .join('\n');
+        artifacts.push({
+          type: 'log' as const,
+          label: `Cleanup executed: ${done} done, ${skipped} skipped, ${failed} failed`,
+          content: execLines,
+        });
+      } else {
+        artifacts.push({
+          type: 'log' as const,
+          label: 'Cleanup approval',
+          content: `Rejected${approval.reason ? ': ' + approval.reason : ''}`,
+        });
+      }
     }
 
     // RAG ingest summary

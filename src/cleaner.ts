@@ -123,6 +123,63 @@ export function proposeCleanupActions(flagged: FlaggedFile[]): CleanupAction[] {
   return actions.sort((a, b) => order[a.priority] - order[b.priority]);
 }
 
+// ─── Executor ────────────────────────────────────────────────────
+
+export interface ExecutionResult {
+  file: string;
+  actionType: CleanupActionType;
+  outcome: 'done' | 'skipped' | 'error';
+  detail: string;
+}
+
+/**
+ * Execute automatable cleanup actions (archive, update-status).
+ * Skips actions that require human judgment (deduplicate, report-broken, review, rename).
+ */
+export async function executeCleanupActions(
+  actions: CleanupAction[],
+  knowledgeRoot: string,
+): Promise<ExecutionResult[]> {
+  const fs = await import('fs/promises');
+  const path = await import('path');
+  const results: ExecutionResult[] = [];
+
+  for (const action of actions) {
+    const absPath = path.join(knowledgeRoot, action.file);
+
+    if (action.actionType === 'archive') {
+      try {
+        const archiveDir = path.join(knowledgeRoot, 'archive');
+        await fs.mkdir(archiveDir, { recursive: true });
+        const dest = path.join(archiveDir, path.basename(action.file));
+        await fs.rename(absPath, dest);
+        results.push({ file: action.file, actionType: action.actionType, outcome: 'done', detail: `Moved → archive/${path.basename(action.file)}` });
+      } catch (err) {
+        results.push({ file: action.file, actionType: action.actionType, outcome: 'error', detail: (err as Error).message });
+      }
+
+    } else if (action.actionType === 'update-status') {
+      try {
+        const content = await fs.readFile(absPath, 'utf8');
+        const updated = content.replace(/^Status:\s*.+$/m, 'Status: STALE');
+        if (updated === content) {
+          results.push({ file: action.file, actionType: action.actionType, outcome: 'skipped', detail: 'No Status header found' });
+        } else {
+          await fs.writeFile(absPath, updated, 'utf8');
+          results.push({ file: action.file, actionType: action.actionType, outcome: 'done', detail: 'Status updated to STALE' });
+        }
+      } catch (err) {
+        results.push({ file: action.file, actionType: action.actionType, outcome: 'error', detail: (err as Error).message });
+      }
+
+    } else {
+      results.push({ file: action.file, actionType: action.actionType, outcome: 'skipped', detail: 'Manual action required' });
+    }
+  }
+
+  return results;
+}
+
 export function formatActionsForApproval(actions: CleanupAction[]): string {
   if (actions.length === 0) return 'No cleanup actions proposed.';
 
