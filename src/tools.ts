@@ -1,12 +1,34 @@
 /**
- * tools.ts — Gemma 4 tool definitions for the knowledge janitor loop.
+ * Deterministic step runner for knowledge-janitor.
+ * Each scope maps to a fixed sequence of JanitorSteps.
+ * No Ollama — all logic is coded.
  */
 
-import type { ToolDef } from '@petedio/shared/agents';
+import type { KnowledgeJanitorInput } from './schema.ts';
 import type { FileEntry } from './scanner.ts';
 import type { StalenessReport, FlaggedFile } from './staleness.ts';
 import type { CleanupAction } from './cleaner.ts';
 import type { IngestResult } from './rag-ingest.ts';
+
+// ─── Step types ───────────────────────────────────────────────────
+
+export type JanitorAction = 'scan' | 'check-staleness' | 'propose-cleanup' | 'ingest-to-rag';
+
+export interface JanitorStep {
+  title: string;
+  action: JanitorAction;
+}
+
+export interface JanitorStepLog {
+  step: JanitorStep;
+  status: 'complete' | 'failed' | 'skipped';
+  output: string;
+  startedAt: string;
+  completedAt: string;
+  durationMs: number;
+}
+
+// ─── Shared state (passed by reference across steps) ─────────────
 
 export interface JanitorState {
   entries?: FileEntry[];
@@ -16,140 +38,92 @@ export interface JanitorState {
   ingestResults?: IngestResult[];
 }
 
-export function buildTools(
-  state: JanitorState,
-  knowledgeRoot: string,
-  blogApiUrl: string,
-): ToolDef[] {
-  return [
-    {
-      name: 'scan_knowledge',
-      description: 'Walk the knowledge/ directory and collect file metadata (size, age, links). Returns a summary of total files found.',
-      parameters: {
-        type: 'object' as const,
-        properties: {} as Record<string, { type: string; description: string }>,
-        required: [],
-      },
-      async execute(_args: Record<string, unknown>): Promise<string> {
-        const { scanKnowledge } = await import('./scanner.ts');
-        state.entries = await scanKnowledge(knowledgeRoot);
-        return `Scanned ${state.entries.length} markdown files in knowledge/.`;
-      },
-    },
+export interface JanitorStepOpts {
+  state: JanitorState;
+  knowledgeRoot: string;
+  blogApiUrl: string;
+}
 
-    {
-      name: 'check_staleness',
-      description: 'Run staleness rules against scanned files. Returns a report of flagged files by category. Must call scan_knowledge first.',
-      parameters: {
-        type: 'object' as const,
-        properties: {} as Record<string, { type: string; description: string }>,
-        required: [],
-      },
-      async execute(_args: Record<string, unknown>): Promise<string> {
-        if (!state.entries) return 'Error: run scan_knowledge first.';
-        const { checkStaleness, buildReport } = await import('./staleness.ts');
-        state.flagged = await checkStaleness(state.entries, knowledgeRoot);
-        state.report = buildReport(state.entries, state.flagged);
-        const { byFlag, scannedCount, flaggedCount } = state.report;
-        const flagSummary = Object.entries(byFlag)
-          .map(([f, n]) => `${f}: ${n}`)
-          .join(', ');
-        return `Checked ${scannedCount} files — ${flaggedCount} flagged. Breakdown: ${flagSummary || 'none'}`;
-      },
-    },
+// ─── Plan builder ─────────────────────────────────────────────────
 
-    {
-      name: 'list_stale_files',
-      description: 'List flagged files with their staleness reasons. Optionally filter by flag type.',
-      parameters: {
-        type: 'object' as const,
-        properties: {
-          flag: {
-            type: 'string',
-            description: 'Optional: filter to a specific flag (stale, broken-links, legacy-paths, stale-wip, duplicate, archive-candidate, empty)',
-          },
-          limit: {
-            type: 'number',
-            description: 'Max files to return (default 20)',
-          },
-        },
-        required: [],
-      },
-      async execute(args: Record<string, unknown>): Promise<string> {
-        if (!state.flagged) return 'Error: run check_staleness first.';
-        const filter = args.flag as string | undefined;
-        const limit = (args.limit as number | undefined) ?? 20;
-        let items = state.flagged;
-        if (filter) {
-          items = items.filter(f => f.flags.includes(filter as never));
-        }
-        items = items.slice(0, limit);
-        if (items.length === 0) return `No files flagged${filter ? ` with "${filter}"` : ''}.`;
-        return items.map(f =>
-          `- ${f.entry.relativePath}\n  flags: [${f.flags.join(', ')}]\n  ${f.reasons.join(' | ')}`
-        ).join('\n');
-      },
-    },
+export function buildPlan(input: KnowledgeJanitorInput): JanitorStep[] {
+  const includeCleanup = input.scope === 'full' || input.scope === 'audit';
+  const includeIngest = input.scope === 'full' || input.scope === 'ingest';
 
-    {
-      name: 'propose_cleanup',
-      description: 'Generate cleanup action proposals based on staleness report. Returns a formatted list for approval. Must call check_staleness first.',
-      parameters: {
-        type: 'object' as const,
-        properties: {} as Record<string, { type: string; description: string }>,
-        required: [],
-      },
-      async execute(_args: Record<string, unknown>): Promise<string> {
-        if (!state.flagged) return 'Error: run check_staleness first.';
-        const { proposeCleanupActions, formatActionsForApproval } = await import('./cleaner.ts');
-        state.actions = proposeCleanupActions(state.flagged);
-        return formatActionsForApproval(state.actions);
-      },
-    },
-
-    {
-      name: 'verify_links',
-      description: 'Check all internal markdown links across scanned files and return broken ones. Must call scan_knowledge first.',
-      parameters: {
-        type: 'object' as const,
-        properties: {} as Record<string, { type: string; description: string }>,
-        required: [],
-      },
-      async execute(_args: Record<string, unknown>): Promise<string> {
-        if (!state.flagged) return 'Error: run check_staleness first (it also verifies links).';
-        const broken = state.flagged.filter(f => f.flags.includes('broken-links'));
-        if (broken.length === 0) return 'No broken links found.';
-        return broken.map(f =>
-          `- ${f.entry.relativePath}: ${f.reasons.find(r => r.includes('Broken')) ?? ''}`
-        ).join('\n');
-      },
-    },
-
-    {
-      name: 'ingest_to_rag',
-      description: 'Feed validated (non-flagged) docs to the blog-api RAG pipeline. Must call check_staleness first.',
-      parameters: {
-        type: 'object' as const,
-        properties: {
-          include_flagged: {
-            type: 'boolean',
-            description: 'If true, ingest all files including flagged ones (default: false — only clean files)',
-          },
-        },
-        required: [],
-      },
-      async execute(args: Record<string, unknown>): Promise<string> {
-        if (!state.entries || !state.flagged) return 'Error: run check_staleness first.';
-        const includeFlagged = args.include_flagged === true;
-        const flaggedPaths = new Set(state.flagged.map(f => f.entry.relativePath));
-        const toIngest = includeFlagged
-          ? state.entries
-          : state.entries.filter(e => !flaggedPaths.has(e.relativePath));
-
-        const { ingestToRag, formatIngestSummary } = await import('./rag-ingest.ts');
-        state.ingestResults = await ingestToRag(toIngest, blogApiUrl);
-        return formatIngestSummary(state.ingestResults);
-      },
-    },
+  const steps: JanitorStep[] = [
+    { title: 'Scan knowledge directory', action: 'scan' },
+    { title: 'Check staleness', action: 'check-staleness' },
   ];
+
+  if (includeCleanup) {
+    steps.push({ title: 'Propose cleanup actions', action: 'propose-cleanup' });
+  }
+  if (includeIngest) {
+    steps.push({ title: 'Ingest clean docs to RAG', action: 'ingest-to-rag' });
+  }
+
+  return steps;
+}
+
+// ─── Step executor ────────────────────────────────────────────────
+
+export async function executeStep(step: JanitorStep, opts: JanitorStepOpts): Promise<string> {
+  const { state, knowledgeRoot, blogApiUrl } = opts;
+
+  switch (step.action) {
+    case 'scan': {
+      const { scanKnowledge } = await import('./scanner.ts');
+      state.entries = await scanKnowledge(knowledgeRoot);
+      return `Scanned ${state.entries.length} markdown files in knowledge/.`;
+    }
+
+    case 'check-staleness': {
+      if (!state.entries) throw new Error('scan must run before check-staleness');
+      const { checkStaleness, buildReport } = await import('./staleness.ts');
+      state.flagged = await checkStaleness(state.entries, knowledgeRoot);
+      state.report = buildReport(state.entries, state.flagged);
+      const { byFlag, scannedCount, flaggedCount } = state.report;
+      const flagSummary = Object.entries(byFlag)
+        .map(([f, n]) => `${f}: ${n}`)
+        .join(', ');
+      return `Checked ${scannedCount} files — ${flaggedCount} flagged. ${flagSummary || 'No flags raised.'}`;
+    }
+
+    case 'propose-cleanup': {
+      if (!state.flagged) throw new Error('check-staleness must run before propose-cleanup');
+      const { proposeCleanupActions, formatActionsForApproval } = await import('./cleaner.ts');
+      state.actions = proposeCleanupActions(state.flagged);
+      if (state.actions.length === 0) return 'No cleanup actions proposed.';
+      return formatActionsForApproval(state.actions);
+    }
+
+    case 'ingest-to-rag': {
+      if (!state.entries || !state.flagged) throw new Error('check-staleness must run before ingest-to-rag');
+      const flaggedPaths = new Set(state.flagged.map(f => f.entry.relativePath));
+      const toIngest = state.entries.filter(e => !flaggedPaths.has(e.relativePath));
+      const { ingestToRag, formatIngestSummary } = await import('./rag-ingest.ts');
+      state.ingestResults = await ingestToRag(toIngest, blogApiUrl);
+      return formatIngestSummary(state.ingestResults);
+    }
+
+    default:
+      throw new Error(`Unknown janitor action: ${(step as JanitorStep).action}`);
+  }
+}
+
+// ─── Report formatter ─────────────────────────────────────────────
+
+export function formatReport(logs: JanitorStepLog[]): string {
+  if (logs.length === 0) return 'No steps executed.';
+  return logs.map((log, index) => {
+    const lines = [
+      `${index + 1}. ${log.step.title} [${log.status}]`,
+      `duration: ${log.durationMs}ms`,
+    ];
+    if (log.output) {
+      lines.push('output:');
+      lines.push(log.output);
+    }
+    return lines.join('\n');
+  }).join('\n\n');
 }
